@@ -39,6 +39,12 @@ if __name__ == "__main__":
     parser.add_argument("--run_compile", action="store_true")
     parser.add_argument("--no_of_images", type=int, default=1)
     parser.add_argument("--resolution", type=int, default=1024)
+    parser.add_argument(
+        "--device-ids", 
+        type=str, 
+        default="0",
+        help="Comma-separated GPU device IDs (e.g., '0' for single GPU, '0,1,2' for multi-GPU with device_map)"
+    )
     args = parser.parse_args()
 
     benchmark_cls = None

@@ -16,7 +16,9 @@ from diffusers import (
     T2IAdapter,
     WuerstchenCombinedPipeline,
     FluxPipeline,
+    FluxTransformer2DModel,
 )
+from transformers import T5EncoderModel
 from diffusers.utils import load_image
 
 
@@ -33,12 +35,6 @@ from utils import (  # noqa: E402
     write_to_csv,
 )
 
-# torch._inductor.config.coordinate_descent_tuning = True
-# torch._inductor.config.freezing = True
-
-## torch._inductor.config.max_autotune = True
-# torch._inductor.config.max_autotune_gemm_backends = "TRITON"
-
 RESOLUTION_MAPPING = {
     "Lykon/DreamShaper": (512, 512),
     "lllyasviel/sd-controlnet-canny": (512, 512),
@@ -51,6 +47,7 @@ RESOLUTION_MAPPING = {
     "stabilityai/sdxl-turbo": (512, 512),
     "etri-vilab/koala-1b": (1024, 1024),
     "black-forest-labs/FLUX.1-dev": (1024,1024),
+    "black-forest-labs/FLUX.1-schnell": (1024,1024),
 }
 
 
@@ -68,11 +65,13 @@ class BaseBenchmak:
 
     def get_result_filepath(self, args):
         pipeline_class_name = str(self.pipe.__class__.__name__)
+        # Include device info in filename
+        device_suffix = f"-devices@{args.device_ids.replace(',', '_')}" if hasattr(args, 'device_ids') else ""
         name = (
             args.ckpt.replace("/", "_")
             + "_"
             + pipeline_class_name
-            + f"-bs@{args.batch_size}-steps@{args.num_inference_steps}-mco@{args.model_cpu_offload}-compile@{args.run_compile}.csv"
+            + f"-bs@{args.batch_size}-steps@{args.num_inference_steps}-mco@{args.model_cpu_offload}-compile@{args.run_compile}{device_suffix}.csv"
         )
         filepath = os.path.join(BASE_PATH, name)
         return filepath
@@ -82,35 +81,83 @@ class TextToImageBenchmark(BaseBenchmak):
     pipeline_class = AutoPipelineForText2Image
 
     def __init__(self, args):
+        # Parse device IDs
+        device_ids = [int(d.strip()) for d in args.device_ids.split(',')]
+        num_gpus = len(device_ids)
+        multi_gpu = num_gpus > 1
+        
+        # Set CUDA_VISIBLE_DEVICES if multiple GPUs specified
+        if multi_gpu:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in device_ids)
+            print(f"[INFO] Using {num_gpus} GPUs: {device_ids}")
+        
+        # Select dtype
         if args.dtype == "FP16":
-            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=torch.float16)
+            dtype = torch.float16
         elif args.dtype == "BF16":
-            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=torch.bfloat16)
+            dtype = torch.bfloat16
         elif args.dtype == "FP32":
-            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=torch.float32)
+            dtype = torch.float32
         else:
             raise TypeError(f"Unsupported data type: {args.dtype}. "
                         f"Supported types are: BF16, FP32, FP16.")
-        pipe = pipe.to("cuda")
+        
+        # Load pipeline with multi-GPU support for FLUX models
+        if multi_gpu and "FLUX" in args.ckpt:
+            print(f"[INFO] Distributing FLUX model across {num_gpus} GPUs using device_map='auto'")
+            
+            # Load transformer with device_map to distribute across GPUs
+            transformer = FluxTransformer2DModel.from_pretrained(
+                args.ckpt,
+                subfolder="transformer",
+                torch_dtype=dtype,
+                device_map="auto"
+            )
+            
+            # Load text encoder with device_map
+            text_encoder_2 = T5EncoderModel.from_pretrained(
+                args.ckpt,
+                subfolder="text_encoder_2",
+                torch_dtype=dtype,
+                device_map="auto"
+            )
+            
+            # Load the rest of the pipeline
+            pipe = FluxPipeline.from_pretrained(
+                args.ckpt,
+                transformer=None,
+                text_encoder_2=None,
+                torch_dtype=dtype
+            )
+            
+            # Assign the distributed components
+            pipe.transformer = transformer
+            pipe.text_encoder_2 = text_encoder_2
+            
+            # Move other components to first device (after CUDA_VISIBLE_DEVICES, it becomes cuda:0)
+            pipe.text_encoder = pipe.text_encoder.to("cuda:0")
+            pipe.vae = pipe.vae.to("cuda:0")
+        else:
+            # Single GPU or non-FLUX models
+            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=dtype)
+            pipe = pipe.to("cuda")
 
         if args.run_compile:
             if isinstance(pipe, FluxPipeline):
                 pipe.transformer.to(memory_format=torch.channels_last)
-                #pipe.vae.to(memory_format=torch.channels_last)
-                print("Run torch compile")
+                print("[INFO] Run torch compile")
                 pipe.transformer = torch.compile(pipe.transformer, mode="reduce-overhead", fullgraph=True)
-                #pipe.vae.decode = torch.compile(pipe.vae.decode, mode="reduce-overhead", fullgraph=True)
 
             elif not isinstance(pipe, WuerstchenCombinedPipeline):
                 pipe.unet.to(memory_format=torch.channels_last)
-                print("Run torch compile")
+                print("[INFO] Run torch compile")
                 pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
 
                 if hasattr(pipe, "movq") and getattr(pipe, "movq", None) is not None:
                     pipe.movq.to(memory_format=torch.channels_last)
                     pipe.movq = torch.compile(pipe.movq, mode="reduce-overhead", fullgraph=True)
             else:
-                print("Run torch compile")
+                print("[INFO] Run torch compile")
                 pipe.decoder = torch.compile(pipe.decoder, mode="reduce-overhead", fullgraph=True)
                 pipe.vqgan = torch.compile(pipe.vqgan, mode="reduce-overhead", fullgraph=True)
 
@@ -149,35 +196,83 @@ class TextToImageBenchmark_multi_image(BaseBenchmak):
     pipeline_class = AutoPipelineForText2Image
 
     def __init__(self, args):
+        # Parse device IDs
+        device_ids = [int(d.strip()) for d in args.device_ids.split(',')]
+        num_gpus = len(device_ids)
+        multi_gpu = num_gpus > 1
+        
+        # Set CUDA_VISIBLE_DEVICES if multiple GPUs specified
+        if multi_gpu:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in device_ids)
+            print(f"[INFO] Using {num_gpus} GPUs: {device_ids}")
+        
+        # Select dtype
         if args.dtype == "FP16":
-            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=torch.float16)
+            dtype = torch.float16
         elif args.dtype == "BF16":
-            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=torch.bfloat16)
+            dtype = torch.bfloat16
         elif args.dtype == "FP32":
-            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=torch.float32)
+            dtype = torch.float32
         else:
             raise TypeError(f"Unsupported data type: {args.dtype}. "
                         f"Supported types are: BF16, FP32, FP16.")
-        pipe = pipe.to("cuda")
+        
+        # Load pipeline with multi-GPU support for FLUX models
+        if multi_gpu and "FLUX" in args.ckpt:
+            print(f"[INFO] Distributing FLUX model across {num_gpus} GPUs using device_map='auto'")
+            
+            # Load transformer with device_map to distribute across GPUs
+            transformer = FluxTransformer2DModel.from_pretrained(
+                args.ckpt,
+                subfolder="transformer",
+                torch_dtype=dtype,
+                device_map="auto"
+            )
+            
+            # Load text encoder with device_map
+            text_encoder_2 = T5EncoderModel.from_pretrained(
+                args.ckpt,
+                subfolder="text_encoder_2",
+                torch_dtype=dtype,
+                device_map="auto"
+            )
+            
+            # Load the rest of the pipeline
+            pipe = FluxPipeline.from_pretrained(
+                args.ckpt,
+                transformer=None,
+                text_encoder_2=None,
+                torch_dtype=dtype
+            )
+            
+            # Assign the distributed components
+            pipe.transformer = transformer
+            pipe.text_encoder_2 = text_encoder_2
+            
+            # Move other components to first device
+            pipe.text_encoder = pipe.text_encoder.to("cuda:0")
+            pipe.vae = pipe.vae.to("cuda:0")
+        else:
+            # Single GPU or non-FLUX models
+            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=dtype)
+            pipe = pipe.to("cuda")
 
         if args.run_compile:
             if isinstance(pipe, FluxPipeline):
                 pipe.transformer.to(memory_format=torch.channels_last)
-                #pipe.vae.to(memory_format=torch.channels_last)
-                print("Run torch compile")
+                print("[INFO] Run torch compile")
                 pipe.transformer = torch.compile(pipe.transformer, mode="reduce-overhead", fullgraph=True)
-                #pipe.vae.decode = torch.compile(pipe.vae.decode, mode="reduce-overhead", fullgraph=True)
 
             elif not isinstance(pipe, WuerstchenCombinedPipeline):
                 pipe.unet.to(memory_format=torch.channels_last)
-                print("Run torch compile")
+                print("[INFO] Run torch compile")
                 pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
 
                 if hasattr(pipe, "movq") and getattr(pipe, "movq", None) is not None:
                     pipe.movq.to(memory_format=torch.channels_last)
                     pipe.movq = torch.compile(pipe.movq, mode="reduce-overhead", fullgraph=True)
             else:
-                print("Run torch compile")
+                print("[INFO] Run torch compile")
                 pipe.decoder = torch.compile(pipe.decoder, mode="reduce-overhead", fullgraph=True)
                 pipe.vqgan = torch.compile(pipe.vqgan, mode="reduce-overhead", fullgraph=True)
 
@@ -187,7 +282,7 @@ class TextToImageBenchmark_multi_image(BaseBenchmak):
     def run_inference(self, pipe, args):
         total_images = args.no_of_images
         batch_size = args.batch_size
-        num_batches = (total_images + batch_size - 1) // batch_size  # Calculate the number of batches needed
+        num_batches = (total_images + batch_size - 1) // batch_size
 
         all_images = []
 
@@ -203,17 +298,6 @@ class TextToImageBenchmark_multi_image(BaseBenchmak):
             images = image_output.images
             all_images.extend(images)
 
-            # Print the type and attributes of the image object
-            '''
-            print(f"**********the prompt is {PROMPT}**********")
-            print(f"Type of generated image: {type(image_output)}")
-            print(f"Attributes of generated image: {dir(image_output)}")
-            if isinstance(images, list) and len(images) > 0:
-                print(f"******************Generated image size: {images[0].size}*****************")
-            else:
-                print("Generated images is not a list or is empty.")
-            '''
-        # Now all_images contains 1000 images
         print(f"Total images generated: {len(all_images)}")
 
     def benchmark(self, args):
@@ -246,215 +330,3 @@ class TurboTextToImageBenchmark(TextToImageBenchmark):
             num_images_per_prompt=args.batch_size,
             guidance_scale=0.0,
         )
-
-
-class LCMLoRATextToImageBenchmark(TextToImageBenchmark):
-    lora_id = "latent-consistency/lcm-lora-sdxl"
-
-    def __init__(self, args):
-        super().__init__(args)
-        self.pipe.load_lora_weights(self.lora_id)
-        self.pipe.fuse_lora()
-        self.pipe.unload_lora_weights()
-        self.pipe.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
-
-    def get_result_filepath(self, args):
-        pipeline_class_name = str(self.pipe.__class__.__name__)
-        name = (
-            self.lora_id.replace("/", "_")
-            + "_"
-            + pipeline_class_name
-            + f"-bs@{args.batch_size}-steps@{args.num_inference_steps}-mco@{args.model_cpu_offload}-compile@{args.run_compile}.csv"
-        )
-        filepath = os.path.join(BASE_PATH, name)
-        return filepath
-
-    def run_inference(self, pipe, args):
-        _ = pipe(
-            prompt=PROMPT,
-            num_inference_steps=args.num_inference_steps,
-            num_images_per_prompt=args.batch_size,
-            guidance_scale=1.0,
-        )
-
-    def benchmark(self, args):
-        flush()
-
-        print(f"[INFO] {self.pipe.__class__.__name__}: Running benchmark with: {vars(args)}\n")
-
-        time = benchmark_fn(self.run_inference, self.pipe, args)  # in seconds.
-        memory = bytes_to_giga_bytes(torch.cuda.max_memory_allocated())  # in GBs.
-        benchmark_info = BenchmarkInfo(time=time, memory=memory)
-
-        pipeline_class_name = str(self.pipe.__class__.__name__)
-        flush()
-        csv_dict = generate_csv_dict(
-            pipeline_cls=pipeline_class_name, ckpt=self.lora_id, args=args, benchmark_info=benchmark_info
-        )
-        filepath = self.get_result_filepath(args)
-        write_to_csv(filepath, csv_dict)
-        print(f"Logs written to: {filepath}")
-        flush()
-
-
-class ImageToImageBenchmark(TextToImageBenchmark):
-    pipeline_class = AutoPipelineForImage2Image
-    url = "https://huggingface.co/datasets/diffusers/docs-images/resolve/main/benchmarking/1665_Girl_with_a_Pearl_Earring.jpg"
-    image = load_image(url).convert("RGB")
-
-    def __init__(self, args):
-        super().__init__(args)
-        self.image = self.image.resize(RESOLUTION_MAPPING[args.ckpt])
-
-    def run_inference(self, pipe, args):
-        _ = pipe(
-            prompt=PROMPT,
-            image=self.image,
-            num_inference_steps=args.num_inference_steps,
-            num_images_per_prompt=args.batch_size,
-        )
-
-
-class TurboImageToImageBenchmark(ImageToImageBenchmark):
-    def __init__(self, args):
-        super().__init__(args)
-
-    def run_inference(self, pipe, args):
-        _ = pipe(
-            prompt=PROMPT,
-            image=self.image,
-            num_inference_steps=args.num_inference_steps,
-            num_images_per_prompt=args.batch_size,
-            guidance_scale=0.0,
-            strength=0.5,
-        )
-
-
-class InpaintingBenchmark(ImageToImageBenchmark):
-    pipeline_class = AutoPipelineForInpainting
-    mask_url = "https://huggingface.co/datasets/diffusers/docs-images/resolve/main/benchmarking/overture-creations-5sI6fQgYIuo_mask.png"
-    mask = load_image(mask_url).convert("RGB")
-
-    def __init__(self, args):
-        super().__init__(args)
-        self.image = self.image.resize(RESOLUTION_MAPPING[args.ckpt])
-        self.mask = self.mask.resize(RESOLUTION_MAPPING[args.ckpt])
-
-    def run_inference(self, pipe, args):
-        _ = pipe(
-            prompt=PROMPT,
-            image=self.image,
-            mask_image=self.mask,
-            num_inference_steps=args.num_inference_steps,
-            num_images_per_prompt=args.batch_size,
-        )
-
-
-class IPAdapterTextToImageBenchmark(TextToImageBenchmark):
-    url = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/load_neg_embed.png"
-    image = load_image(url)
-
-    def __init__(self, args):
-        pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=torch.float16).to("cuda")
-        pipe.load_ip_adapter(
-            args.ip_adapter_id[0],
-            subfolder="models" if "sdxl" not in args.ip_adapter_id[1] else "sdxl_models",
-            weight_name=args.ip_adapter_id[1],
-        )
-
-        if args.run_compile:
-            pipe.unet.to(memory_format=torch.channels_last)
-            print("Run torch compile")
-            pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
-
-        pipe.set_progress_bar_config(disable=True)
-        self.pipe = pipe
-
-    def run_inference(self, pipe, args):
-        _ = pipe(
-            prompt=PROMPT,
-            ip_adapter_image=self.image,
-            num_inference_steps=args.num_inference_steps,
-            num_images_per_prompt=args.batch_size,
-        )
-
-
-class ControlNetBenchmark(TextToImageBenchmark):
-    pipeline_class = StableDiffusionControlNetPipeline
-    aux_network_class = ControlNetModel
-    root_ckpt = "Lykon/DreamShaper"
-
-    url = "https://huggingface.co/datasets/diffusers/docs-images/resolve/main/benchmarking/canny_image_condition.png"
-    image = load_image(url).convert("RGB")
-
-    def __init__(self, args):
-        aux_network = self.aux_network_class.from_pretrained(args.ckpt, torch_dtype=torch.float16)
-        pipe = self.pipeline_class.from_pretrained(self.root_ckpt, controlnet=aux_network, torch_dtype=torch.float16)
-        pipe = pipe.to("cuda")
-
-        pipe.set_progress_bar_config(disable=True)
-        self.pipe = pipe
-
-        if args.run_compile:
-            pipe.unet.to(memory_format=torch.channels_last)
-            pipe.controlnet.to(memory_format=torch.channels_last)
-
-            print("Run torch compile")
-            pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
-            pipe.controlnet = torch.compile(pipe.controlnet, mode="reduce-overhead", fullgraph=True)
-
-        self.image = self.image.resize(RESOLUTION_MAPPING[args.ckpt])
-
-    def run_inference(self, pipe, args):
-        _ = pipe(
-            prompt=PROMPT,
-            image=self.image,
-            num_inference_steps=args.num_inference_steps,
-            num_images_per_prompt=args.batch_size,
-        )
-
-
-class ControlNetSDXLBenchmark(ControlNetBenchmark):
-    pipeline_class = StableDiffusionXLControlNetPipeline
-    root_ckpt = "stabilityai/stable-diffusion-xl-base-1.0"
-
-    def __init__(self, args):
-        super().__init__(args)
-
-
-class T2IAdapterBenchmark(ControlNetBenchmark):
-    pipeline_class = StableDiffusionAdapterPipeline
-    aux_network_class = T2IAdapter
-    root_ckpt = "Lykon/DreamShaper"
-
-    url = "https://huggingface.co/datasets/diffusers/docs-images/resolve/main/benchmarking/canny_for_adapter.png"
-    image = load_image(url).convert("L")
-
-    def __init__(self, args):
-        aux_network = self.aux_network_class.from_pretrained(args.ckpt, torch_dtype=torch.float16)
-        pipe = self.pipeline_class.from_pretrained(self.root_ckpt, adapter=aux_network, torch_dtype=torch.float16)
-        pipe = pipe.to("cuda")
-
-        pipe.set_progress_bar_config(disable=True)
-        self.pipe = pipe
-
-        if args.run_compile:
-            pipe.unet.to(memory_format=torch.channels_last)
-            pipe.adapter.to(memory_format=torch.channels_last)
-
-            print("Run torch compile")
-            pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
-            pipe.adapter = torch.compile(pipe.adapter, mode="reduce-overhead", fullgraph=True)
-
-        self.image = self.image.resize(RESOLUTION_MAPPING[args.ckpt])
-
-
-class T2IAdapterSDXLBenchmark(T2IAdapterBenchmark):
-    pipeline_class = StableDiffusionXLAdapterPipeline
-    root_ckpt = "stabilityai/stable-diffusion-xl-base-1.0"
-
-    url = "https://huggingface.co/datasets/diffusers/docs-images/resolve/main/benchmarking/canny_for_adapter_sdxl.png"
-    image = load_image(url)
-
-    def __init__(self, args):
-        super().__init__(args)
