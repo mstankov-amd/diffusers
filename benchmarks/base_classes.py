@@ -65,13 +65,14 @@ class BaseBenchmak:
 
     def get_result_filepath(self, args):
         pipeline_class_name = str(self.pipe.__class__.__name__)
-        # Include device info in filename
-        device_suffix = f"-devices@{args.device_ids.replace(',', '_')}" if hasattr(args, 'device_ids') else ""
+        # Include GPU count in filename if multi-GPU
+        num_gpus = getattr(args, 'num_gpus', 1)
+        gpu_suffix = f"-gpus@{num_gpus}" if num_gpus > 1 else ""
         name = (
             args.ckpt.replace("/", "_")
             + "_"
             + pipeline_class_name
-            + f"-bs@{args.batch_size}-steps@{args.num_inference_steps}-mco@{args.model_cpu_offload}-compile@{args.run_compile}{device_suffix}.csv"
+            + f"-bs@{args.batch_size}-steps@{args.num_inference_steps}-mco@{args.model_cpu_offload}-compile@{args.run_compile}{gpu_suffix}.csv"
         )
         filepath = os.path.join(BASE_PATH, name)
         return filepath
@@ -81,13 +82,13 @@ class TextToImageBenchmark(BaseBenchmak):
     pipeline_class = AutoPipelineForText2Image
 
     def __init__(self, args):
-        # Parse device IDs
-        device_ids = [int(d.strip()) for d in args.device_ids.split(',')]
-        num_gpus = len(device_ids)
+        # Get number of GPUs to use
+        num_gpus = getattr(args, 'num_gpus', 1)
         multi_gpu = num_gpus > 1
         
         # Set CUDA_VISIBLE_DEVICES if multiple GPUs specified
         if multi_gpu:
+            device_ids = list(range(num_gpus))
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in device_ids)
             print(f"[INFO] Using {num_gpus} GPUs: {device_ids}")
         
@@ -196,13 +197,13 @@ class TextToImageBenchmark_multi_image(BaseBenchmak):
     pipeline_class = AutoPipelineForText2Image
 
     def __init__(self, args):
-        # Parse device IDs
-        device_ids = [int(d.strip()) for d in args.device_ids.split(',')]
-        num_gpus = len(device_ids)
+        # Get number of GPUs to use
+        num_gpus = getattr(args, 'num_gpus', 1)
         multi_gpu = num_gpus > 1
         
         # Set CUDA_VISIBLE_DEVICES if multiple GPUs specified
         if multi_gpu:
+            device_ids = list(range(num_gpus))
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in device_ids)
             print(f"[INFO] Using {num_gpus} GPUs: {device_ids}")
         
