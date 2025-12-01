@@ -15,6 +15,7 @@ ALL_T2I_CKPTS = [
     "stabilityai/sdxl-turbo",
     "etri-vilab/koala-1b",
     "black-forest-labs/FLUX.1-dev",
+    "black-forest-labs/FLUX.1-schnell",
 ]
 
 
