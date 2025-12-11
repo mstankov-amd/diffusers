@@ -135,9 +135,20 @@ class TextToImageBenchmark(BaseBenchmak):
             pipe.transformer = transformer
             pipe.text_encoder_2 = text_encoder_2
             
+            # Enable gradient checkpointing to reduce memory for large batches
+            if hasattr(pipe.transformer, 'enable_gradient_checkpointing'):
+                pipe.transformer.enable_gradient_checkpointing()
+                print("[INFO] Enabled gradient checkpointing for transformer")
+            
             # Move other components to first device (after CUDA_VISIBLE_DEVICES, it becomes cuda:0)
             pipe.text_encoder = pipe.text_encoder.to("cuda:0")
             pipe.vae = pipe.vae.to("cuda:0")
+            
+            # Enable VAE tiling for large batch sizes to reduce memory
+            if args.batch_size > 4:
+                pipe.vae.enable_tiling()
+                pipe.vae.enable_slicing()
+                print(f"[INFO] Enabled VAE tiling and slicing for batch_size={args.batch_size}")
         else:
             # Single GPU or non-FLUX models
             pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=dtype)
@@ -250,9 +261,20 @@ class TextToImageBenchmark_multi_image(BaseBenchmak):
             pipe.transformer = transformer
             pipe.text_encoder_2 = text_encoder_2
             
+            # Enable gradient checkpointing to reduce memory for large batches
+            if hasattr(pipe.transformer, 'enable_gradient_checkpointing'):
+                pipe.transformer.enable_gradient_checkpointing()
+                print("[INFO] Enabled gradient checkpointing for transformer")
+            
             # Move other components to first device (after CUDA_VISIBLE_DEVICES, it becomes cuda:0)
             pipe.text_encoder = pipe.text_encoder.to("cuda:0")
             pipe.vae = pipe.vae.to("cuda:0")
+            
+            # Enable VAE tiling for large batch sizes to reduce memory
+            if args.batch_size > 4:
+                pipe.vae.enable_tiling()
+                pipe.vae.enable_slicing()
+                print(f"[INFO] Enabled VAE tiling and slicing for batch_size={args.batch_size}")
         else:
             # Single GPU or non-FLUX models
             pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=dtype)
