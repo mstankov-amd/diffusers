@@ -105,14 +105,14 @@ class TextToImageBenchmark(BaseBenchmak):
         
         # Load pipeline with multi-GPU support for FLUX models
         if multi_gpu and "FLUX" in args.ckpt:
-            print(f"[INFO] Distributing FLUX model across {num_gpus} GPUs using device_map='auto'")
+            print(f"[INFO] Distributing FLUX model across {num_gpus} GPUs using device_map='balanced'")
             
             # Load transformer with device_map to distribute across GPUs
             transformer = FluxTransformer2DModel.from_pretrained(
                 args.ckpt,
                 subfolder="transformer",
                 torch_dtype=dtype,
-                device_map="auto"
+                device_map="balanced"
             )
             
             # Load text encoder with device_map
@@ -120,7 +120,7 @@ class TextToImageBenchmark(BaseBenchmak):
                 args.ckpt,
                 subfolder="text_encoder_2",
                 torch_dtype=dtype,
-                device_map="auto"
+                device_map="balanced"
             )
             
             # Load the rest of the pipeline
@@ -220,14 +220,14 @@ class TextToImageBenchmark_multi_image(BaseBenchmak):
         
         # Load pipeline with multi-GPU support for FLUX models
         if multi_gpu and "FLUX" in args.ckpt:
-            print(f"[INFO] Distributing FLUX model across {num_gpus} GPUs using device_map='auto'")
+            print(f"[INFO] Distributing FLUX model across {num_gpus} GPUs using device_map='balanced'")
             
             # Load transformer with device_map to distribute across GPUs
             transformer = FluxTransformer2DModel.from_pretrained(
                 args.ckpt,
                 subfolder="transformer",
                 torch_dtype=dtype,
-                device_map="auto"
+                device_map="balanced"
             )
             
             # Load text encoder with device_map
@@ -235,7 +235,7 @@ class TextToImageBenchmark_multi_image(BaseBenchmak):
                 args.ckpt,
                 subfolder="text_encoder_2",
                 torch_dtype=dtype,
-                device_map="auto"
+                device_map="balanced"
             )
             
             # Load the rest of the pipeline
@@ -250,7 +250,7 @@ class TextToImageBenchmark_multi_image(BaseBenchmak):
             pipe.transformer = transformer
             pipe.text_encoder_2 = text_encoder_2
             
-            # Move other components to first device
+            # Move other components to first device (after CUDA_VISIBLE_DEVICES, it becomes cuda:0)
             pipe.text_encoder = pipe.text_encoder.to("cuda:0")
             pipe.vae = pipe.vae.to("cuda:0")
         else:
