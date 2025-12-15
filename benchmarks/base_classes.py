@@ -148,7 +148,10 @@ class TextToImageBenchmark(BaseBenchmak):
             if args.batch_size > 4:
                 pipe.vae.enable_tiling()
                 pipe.vae.enable_slicing()
+                micro_batch_size = 4 if args.batch_size >= 16 else min(4, args.batch_size)
+                num_micro_batches = (args.batch_size + micro_batch_size - 1) // micro_batch_size
                 print(f"[INFO] Enabled VAE tiling and slicing for batch_size={args.batch_size}")
+                print(f"[INFO] Will use micro-batching: {args.batch_size} images split into {num_micro_batches} batches of {micro_batch_size}")
         else:
             # Single GPU or non-FLUX models
             pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=dtype)
@@ -177,13 +180,35 @@ class TextToImageBenchmark(BaseBenchmak):
         self.pipe = pipe
 
     def run_inference(self, pipe, args):
-        _ = pipe(
-            prompt=PROMPT,
-            num_inference_steps=args.num_inference_steps,
-            num_images_per_prompt=args.batch_size,
-            height=args.resolution,
-            width=args.resolution,
-        )
+        # Use micro-batching for large batches on multi-GPU FLUX to avoid OOM
+        num_gpus = getattr(args, 'num_gpus', 1)
+        use_microbatching = num_gpus > 1 and "FLUX" in args.ckpt and args.batch_size > 4
+        
+        if use_microbatching:
+            # Determine micro-batch size based on total batch size
+            micro_batch_size = 4 if args.batch_size >= 16 else min(4, args.batch_size)
+            num_micro_batches = (args.batch_size + micro_batch_size - 1) // micro_batch_size
+            
+            all_images = []
+            for i in range(num_micro_batches):
+                current_batch_size = min(micro_batch_size, args.batch_size - i * micro_batch_size)
+                result = pipe(
+                    prompt=PROMPT,
+                    num_inference_steps=args.num_inference_steps,
+                    num_images_per_prompt=current_batch_size,
+                    height=args.resolution,
+                    width=args.resolution,
+                )
+                all_images.extend(result.images)
+        else:
+            # Standard single-batch inference
+            _ = pipe(
+                prompt=PROMPT,
+                num_inference_steps=args.num_inference_steps,
+                num_images_per_prompt=args.batch_size,
+                height=args.resolution,
+                width=args.resolution,
+            )
 
     def benchmark(self, args):
         flush()
@@ -274,7 +299,10 @@ class TextToImageBenchmark_multi_image(BaseBenchmak):
             if args.batch_size > 4:
                 pipe.vae.enable_tiling()
                 pipe.vae.enable_slicing()
+                micro_batch_size = 4 if args.batch_size >= 16 else min(4, args.batch_size)
+                num_micro_batches = (args.batch_size + micro_batch_size - 1) // micro_batch_size
                 print(f"[INFO] Enabled VAE tiling and slicing for batch_size={args.batch_size}")
+                print(f"[INFO] Will use micro-batching: {args.batch_size} images split into {num_micro_batches} batches of {micro_batch_size}")
         else:
             # Single GPU or non-FLUX models
             pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=dtype)
