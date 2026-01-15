@@ -15,6 +15,7 @@ ALL_T2I_CKPTS = [
     "stabilityai/sdxl-turbo",
     "etri-vilab/koala-1b",
     "black-forest-labs/FLUX.1-dev",
+    "black-forest-labs/FLUX.1-schnell",
 ]
 
 
@@ -38,6 +39,7 @@ if __name__ == "__main__":
     parser.add_argument("--run_compile", action="store_true")
     parser.add_argument("--no_of_images", type=int, default=1)
     parser.add_argument("--resolution", type=int, default=1024)
+    parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs for model parallelism")
     args = parser.parse_args()
 
     benchmark_cls = None

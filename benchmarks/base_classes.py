@@ -17,6 +17,8 @@ from diffusers import (
     WuerstchenCombinedPipeline,
     FluxPipeline,
 )
+from diffusers.models import FluxTransformer2DModel
+from transformers import T5EncoderModel
 from diffusers.utils import load_image
 
 
@@ -50,8 +52,89 @@ RESOLUTION_MAPPING = {
     "stabilityai/stable-diffusion-xl-refiner-1.0": (1024, 1024),
     "stabilityai/sdxl-turbo": (512, 512),
     "etri-vilab/koala-1b": (1024, 1024),
-    "black-forest-labs/FLUX.1-dev": (1024,1024),
+    "black-forest-labs/FLUX.1-dev": (1024, 1024),
+    "black-forest-labs/FLUX.1-schnell": (1024, 1024),
 }
+
+
+def setup_multi_gpu_flux_pipeline(model_name, num_gpus, dtype):
+    """
+    Setup FLUX pipeline with multi-GPU model parallelism:
+    - Transformer is distributed across GPUs 0 to (num_gpus-1) for smaller VRAM
+    - VAE and Encoders on last GPU
+    """
+    print(f"\n{'='*70}")
+    print(f"Setting up FLUX with {num_gpus} GPU(s) - Model Parallelism Mode")
+    print(f"{'='*70}")
+    
+    if num_gpus == 1:
+        # Single GPU - simple setup
+        print("[INFO] Single GPU mode - loading entire pipeline on cuda:0")
+        pipe = FluxPipeline.from_pretrained(
+            model_name,
+            torch_dtype=dtype
+        )
+        pipe = pipe.to("cuda:0")
+        return pipe
+    
+    # Multi-GPU setup with model parallelism
+    transformer_gpus = num_gpus - 1
+    last_gpu = f"cuda:{num_gpus-1}"
+    
+    print(f"[INFO] Multi-GPU Model Parallelism Strategy:")
+    print(f"  - Transformer: Split across GPUs 0 to {transformer_gpus-1} ({transformer_gpus} GPUs)")
+    print(f"  - VAE + Encoders: Dedicated to {last_gpu}")
+    print(f"  - This configuration reduces VRAM requirements per GPU")
+    
+    # Set visible devices
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_gpus))
+    
+    # Load transformer with device_map to distribute across first (num_gpus-1) GPUs
+    print(f"[INFO] Loading and distributing transformer across {transformer_gpus} GPU(s)...")
+    # Use smaller memory limit per GPU to handle smaller VRAM
+    max_memory_per_gpu = {i: "20GiB" for i in range(transformer_gpus)}
+    
+    transformer = FluxTransformer2DModel.from_pretrained(
+        model_name,
+        subfolder="transformer",
+        torch_dtype=dtype,
+        device_map="auto",
+        max_memory=max_memory_per_gpu
+    )
+    
+    print(f"[INFO] Transformer device map: {transformer.hf_device_map}")
+    
+    # Load T5 encoder on last GPU
+    print(f"[INFO] Loading T5 encoder on {last_gpu}...")
+    text_encoder_2 = T5EncoderModel.from_pretrained(
+        model_name,
+        subfolder="text_encoder_2",
+        torch_dtype=dtype,
+    )
+    text_encoder_2 = text_encoder_2.to(last_gpu)
+    
+    # Load rest of pipeline without transformer and text_encoder_2
+    print(f"[INFO] Loading remaining pipeline components on {last_gpu}...")
+    pipe = FluxPipeline.from_pretrained(
+        model_name,
+        transformer=None,
+        text_encoder_2=None,
+        torch_dtype=dtype
+    )
+    
+    # Move remaining components to last GPU
+    pipe.vae = pipe.vae.to(last_gpu)
+    pipe.text_encoder = pipe.text_encoder.to(last_gpu)
+    
+    # Assign distributed components
+    pipe.transformer = transformer
+    pipe.text_encoder_2 = text_encoder_2
+    
+    print(f"[INFO] Pipeline setup complete!")
+    print(f"[INFO] Memory distribution optimized for smaller VRAM GPUs")
+    print(f"{'='*70}\n")
+    
+    return pipe
 
 
 class BaseBenchmak:
@@ -82,16 +165,29 @@ class TextToImageBenchmark(BaseBenchmak):
     pipeline_class = AutoPipelineForText2Image
 
     def __init__(self, args):
+        # Determine dtype
         if args.dtype == "FP16":
-            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=torch.float16)
+            dtype = torch.float16
         elif args.dtype == "BF16":
-            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=torch.bfloat16)
+            dtype = torch.bfloat16
         elif args.dtype == "FP32":
-            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=torch.float32)
+            dtype = torch.float32
         else:
             raise TypeError(f"Unsupported data type: {args.dtype}. "
                         f"Supported types are: BF16, FP32, FP16.")
-        pipe = pipe.to("cuda")
+        
+        # Check if this is a FLUX model and multi-GPU is requested
+        is_flux_model = "flux" in args.ckpt.lower() or "black-forest-labs" in args.ckpt.lower()
+        num_gpus = getattr(args, 'num_gpus', 1)
+        
+        if is_flux_model and num_gpus > 1:
+            # Use multi-GPU model parallelism for FLUX
+            print(f"[INFO] Detected FLUX model with {num_gpus} GPUs - using model parallelism")
+            pipe = setup_multi_gpu_flux_pipeline(args.ckpt, num_gpus, dtype)
+        else:
+            # Standard single-GPU loading
+            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=dtype)
+            pipe = pipe.to("cuda")
 
         if args.run_compile:
             if isinstance(pipe, FluxPipeline):
@@ -149,16 +245,29 @@ class TextToImageBenchmark_multi_image(BaseBenchmak):
     pipeline_class = AutoPipelineForText2Image
 
     def __init__(self, args):
+        # Determine dtype
         if args.dtype == "FP16":
-            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=torch.float16)
+            dtype = torch.float16
         elif args.dtype == "BF16":
-            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=torch.bfloat16)
+            dtype = torch.bfloat16
         elif args.dtype == "FP32":
-            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=torch.float32)
+            dtype = torch.float32
         else:
             raise TypeError(f"Unsupported data type: {args.dtype}. "
                         f"Supported types are: BF16, FP32, FP16.")
-        pipe = pipe.to("cuda")
+        
+        # Check if this is a FLUX model and multi-GPU is requested
+        is_flux_model = "flux" in args.ckpt.lower() or "black-forest-labs" in args.ckpt.lower()
+        num_gpus = getattr(args, 'num_gpus', 1)
+        
+        if is_flux_model and num_gpus > 1:
+            # Use multi-GPU model parallelism for FLUX
+            print(f"[INFO] Detected FLUX model with {num_gpus} GPUs - using model parallelism")
+            pipe = setup_multi_gpu_flux_pipeline(args.ckpt, num_gpus, dtype)
+        else:
+            # Standard single-GPU loading
+            pipe = self.pipeline_class.from_pretrained(args.ckpt, torch_dtype=dtype)
+            pipe = pipe.to("cuda")
 
         if args.run_compile:
             if isinstance(pipe, FluxPipeline):
